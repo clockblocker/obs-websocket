@@ -17,6 +17,9 @@ find_package(Qt6 REQUIRED Core Widgets Svg Network)
 # Find nlohmann JSON
 find_package(nlohmann_json 3.11 REQUIRED)
 
+# Fetch reflect-cpp (JSON + nlohmann bridge, bundled yyjson/ctre/enchantum)
+include(cmake/reflect-cpp.cmake)
+
 # Find qrcodegencpp
 set(CMAKE_FIND_PACKAGE_PREFER_CONFIG ON)
 find_package(qrcodegencpp REQUIRED)
@@ -153,6 +156,8 @@ target_compile_options(
           $<$<COMPILE_LANG_AND_ID:CXX,AppleClang,Clang>:-Wno-comma>
           $<$<COMPILE_LANG_AND_ID:CXX,AppleClang,Clang>:-Wno-quoted-include-in-framework-header>)
 
+target_compile_features(obs-websocket PRIVATE cxx_std_20)
+
 target_link_libraries(
   obs-websocket
   PRIVATE OBS::libobs
@@ -163,6 +168,7 @@ target_link_libraries(
           Qt::Svg
           Qt::Network
           nlohmann_json::nlohmann_json
+          reflectcpp::reflectcpp
           Websocketpp::Websocketpp
           Asio::Asio
           qrcodegencpp::qrcodegencpp)
