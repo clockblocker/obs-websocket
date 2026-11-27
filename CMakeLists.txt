@@ -80,6 +80,8 @@ target_sources(
 target_sources(
   obs-websocket
   PRIVATE # cmake-format: sortable
+          src/protocol/ProtocolTypes.h
+          src/protocol/RequestCodec.h
           src/requesthandler/RequestBatchHandler.cpp
           src/requesthandler/RequestBatchHandler.h
           src/requesthandler/RequestHandler.cpp
@@ -104,6 +106,7 @@ target_sources(
           src/requesthandler/rpc/RequestBatchRequest.h
           src/requesthandler/rpc/RequestResult.cpp
           src/requesthandler/rpc/RequestResult.h
+          src/requesthandler/rpc/TypedRequest.h
           src/requesthandler/types/RequestBatchExecutionType.h
           src/requesthandler/types/RequestStatus.h)
 
