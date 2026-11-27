@@ -18,6 +18,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 */
 
 #include "RequestHandler.h"
+#include "rpc/TypedRequest.h"
 
 /**
  * Gets the status of the stream output.
@@ -48,17 +49,16 @@ RequestResult RequestHandler::GetStreamStatus(const Request &)
 	if (std::isnan(outputCongestion)) // libobs does not handle NaN, so we're handling it here
 		outputCongestion = 0.0f;
 
-	json responseData;
-	responseData["outputActive"] = obs_output_active(streamOutput);
-	responseData["outputReconnecting"] = obs_output_reconnecting(streamOutput);
-	responseData["outputTimecode"] = Utils::Obs::StringHelper::DurationToTimecode(outputDuration);
-	responseData["outputDuration"] = outputDuration;
-	responseData["outputCongestion"] = outputCongestion;
-	responseData["outputBytes"] = (uint64_t)obs_output_get_total_bytes(streamOutput);
-	responseData["outputSkippedFrames"] = obs_output_get_frames_dropped(streamOutput);
-	responseData["outputTotalFrames"] = obs_output_get_total_frames(streamOutput);
-
-	return RequestResult::Success(responseData);
+	return ObsWebSocket::MakeResponse(ObsWebSocket::Protocol::GetStreamStatusResponse{
+		.outputActive = obs_output_active(streamOutput),
+		.outputReconnecting = obs_output_reconnecting(streamOutput),
+		.outputTimecode = Utils::Obs::StringHelper::DurationToTimecode(outputDuration),
+		.outputDuration = outputDuration,
+		.outputCongestion = outputCongestion,
+		.outputBytes = static_cast<uint64_t>(obs_output_get_total_bytes(streamOutput)),
+		.outputSkippedFrames = obs_output_get_frames_dropped(streamOutput),
+		.outputTotalFrames = obs_output_get_total_frames(streamOutput),
+	});
 }
 
 /**
@@ -75,16 +75,13 @@ RequestResult RequestHandler::GetStreamStatus(const Request &)
  */
 RequestResult RequestHandler::ToggleStream(const Request &)
 {
-	json responseData;
-	if (obs_frontend_streaming_active()) {
-		obs_frontend_streaming_stop();
-		responseData["outputActive"] = false;
-	} else {
+	const bool nowActive = !obs_frontend_streaming_active();
+	if (nowActive)
 		obs_frontend_streaming_start();
-		responseData["outputActive"] = true;
-	}
+	else
+		obs_frontend_streaming_stop();
 
-	return RequestResult::Success(responseData);
+	return ObsWebSocket::MakeResponse(ObsWebSocket::Protocol::ToggleStreamResponse{.outputActive = nowActive});
 }
 
 /**
@@ -143,20 +140,17 @@ RequestResult RequestHandler::StopStream(const Request &)
  */
 RequestResult RequestHandler::SendStreamCaption(const Request &request)
 {
-	RequestStatus::RequestStatus statusCode;
-	std::string comment;
-	if (!request.ValidateString("captionText", statusCode, comment, true))
-		return RequestResult::Error(statusCode, comment);
+	auto parsed = ObsWebSocket::ParseRequest<ObsWebSocket::Protocol::SendStreamCaptionRequest>(request);
+	if (auto *err = std::get_if<RequestResult>(&parsed))
+		return std::move(*err);
 
 	if (!obs_frontend_streaming_active())
 		return RequestResult::Error(RequestStatus::OutputNotRunning);
 
-	std::string captionText = request.RequestData["captionText"];
-
 	OBSOutputAutoRelease output = obs_frontend_get_streaming_output();
 
 	// 0.0 means no delay until the next caption can be sent
-	obs_output_output_caption_text2(output, captionText.c_str(), 0.0);
+	obs_output_output_caption_text2(output, std::get<0>(parsed).captionText.value().c_str(), 0.0);
 
 	return RequestResult::Success();
 }
