@@ -20,9 +20,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QGuiApplication>
 #include <QScreen>
 #include <QRect>
-#include <sstream>
 
 #include "RequestHandler.h"
+#include "rpc/TypedRequest.h"
 
 /**
  * Gets whether studio is enabled.
@@ -38,9 +38,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
  */
 RequestResult RequestHandler::GetStudioModeEnabled(const Request &)
 {
-	json responseData;
-	responseData["studioModeEnabled"] = obs_frontend_preview_program_mode_active();
-	return RequestResult::Success(responseData);
+	return ObsWebSocket::MakeResponse(ObsWebSocket::Protocol::GetStudioModeEnabledResponse{
+		.studioModeEnabled = obs_frontend_preview_program_mode_active(),
+	});
 }
 
 /**
@@ -57,21 +57,19 @@ RequestResult RequestHandler::GetStudioModeEnabled(const Request &)
  */
 RequestResult RequestHandler::SetStudioModeEnabled(const Request &request)
 {
-	RequestStatus::RequestStatus statusCode;
-	std::string comment;
-	if (!request.ValidateBoolean("studioModeEnabled", statusCode, comment))
-		return RequestResult::Error(statusCode, comment);
+	auto parsed = ObsWebSocket::ParseRequest<ObsWebSocket::Protocol::SetStudioModeEnabledRequest>(request);
+	if (auto *err = std::get_if<RequestResult>(&parsed))
+		return std::move(*err);
 
+	bool studioModeEnabled = std::get<0>(parsed).studioModeEnabled.value();
 	// Avoid queueing tasks if nothing will change
-	if (obs_frontend_preview_program_mode_active() != request.RequestData["studioModeEnabled"]) {
-		// (Bad) Create a boolean then pass it as a reference to the task. Requires `wait` in obs_queue_task() to be true, else undefined behavior
-		bool studioModeEnabled = request.RequestData["studioModeEnabled"];
-		// Queue the task inside of the UI thread to prevent race conditions
+	if (obs_frontend_preview_program_mode_active() != studioModeEnabled) {
+		// Queue the task inside of the UI thread to prevent race conditions (`wait` = true keeps stack ref valid)
 		obs_queue_task(
 			OBS_TASK_UI,
 			[](void *param) {
-				auto studioModeEnabled = (bool *)param;
-				obs_frontend_set_preview_program_mode(*studioModeEnabled);
+				auto enabled = (bool *)param;
+				obs_frontend_set_preview_program_mode(*enabled);
 			},
 			&studioModeEnabled, true);
 	}
@@ -175,26 +173,24 @@ RequestResult RequestHandler::OpenInputInteractDialog(const Request &request)
  */
 RequestResult RequestHandler::GetMonitorList(const Request &)
 {
-	json responseData;
-	std::vector<json> monitorsData;
+	std::vector<ObsWebSocket::Protocol::MonitorInfo> monitors;
 	QList<QScreen *> screensList = QGuiApplication::screens();
+	monitors.reserve(static_cast<size_t>(screensList.size()));
 	for (int screenIndex = 0; screenIndex < screensList.size(); screenIndex++) {
-		json screenData;
 		QScreen const *screen = screensList[screenIndex];
-		std::stringstream nameAndIndex;
-		nameAndIndex << screen->name().toStdString();
-		nameAndIndex << '(' << screenIndex << ')';
-		screenData["monitorName"] = nameAndIndex.str();
-		screenData["monitorIndex"] = screenIndex;
 		const QRect screenGeometry = screen->geometry();
-		screenData["monitorWidth"] = screenGeometry.width();
-		screenData["monitorHeight"] = screenGeometry.height();
-		screenData["monitorPositionX"] = screenGeometry.x();
-		screenData["monitorPositionY"] = screenGeometry.y();
-		monitorsData.push_back(screenData);
+		monitors.push_back(ObsWebSocket::Protocol::MonitorInfo{
+			.monitorName = screen->name().toStdString() + '(' + std::to_string(screenIndex) + ')',
+			.monitorIndex = screenIndex,
+			.monitorWidth = screenGeometry.width(),
+			.monitorHeight = screenGeometry.height(),
+			.monitorPositionX = screenGeometry.x(),
+			.monitorPositionY = screenGeometry.y(),
+		});
 	}
-	responseData["monitors"] = monitorsData;
-	return RequestResult::Success(responseData);
+	return ObsWebSocket::MakeResponse(ObsWebSocket::Protocol::GetMonitorListResponse{
+		.monitors = std::move(monitors),
+	});
 }
 
 /**
@@ -221,38 +217,25 @@ RequestResult RequestHandler::GetMonitorList(const Request &)
  */
 RequestResult RequestHandler::OpenVideoMixProjector(const Request &request)
 {
-	RequestStatus::RequestStatus statusCode;
-	std::string comment;
-	if (!request.ValidateString("videoMixType", statusCode, comment))
-		return RequestResult::Error(statusCode, comment);
+	auto parsed = ObsWebSocket::ParseRequest<ObsWebSocket::Protocol::OpenVideoMixProjectorRequest>(request);
+	if (auto *err = std::get_if<RequestResult>(&parsed))
+		return std::move(*err);
+	const auto &req = std::get<0>(parsed);
 
-	std::string videoMixType = request.RequestData["videoMixType"];
-	const char *projectorType;
-	if (videoMixType == "OBS_WEBSOCKET_VIDEO_MIX_TYPE_PREVIEW")
-		projectorType = "Preview";
-	else if (videoMixType == "OBS_WEBSOCKET_VIDEO_MIX_TYPE_PROGRAM")
+	const std::string_view videoMixType = req.videoMixType.value().str();
+	const char *projectorType = "Preview";
+	if (videoMixType == "OBS_WEBSOCKET_VIDEO_MIX_TYPE_PROGRAM")
 		projectorType = "StudioProgram";
 	else if (videoMixType == "OBS_WEBSOCKET_VIDEO_MIX_TYPE_MULTIVIEW")
 		projectorType = "Multiview";
-	else
-		return RequestResult::Error(RequestStatus::InvalidRequestField,
-					    "The field `videoMixType` has an invalid enum value.");
 
-	int monitorIndex = -1;
-	if (request.Contains("monitorIndex")) {
-		if (!request.ValidateOptionalNumber("monitorIndex", statusCode, comment, -1, 9))
-			return RequestResult::Error(statusCode, comment);
-		monitorIndex = request.RequestData["monitorIndex"];
-	}
-
+	const int monitorIndex = req.monitorIndex.value().value().value();
 	std::string projectorGeometry;
-	if (request.Contains("projectorGeometry")) {
-		if (!request.ValidateOptionalString("projectorGeometry", statusCode, comment))
-			return RequestResult::Error(statusCode, comment);
+	if (req.projectorGeometry.value().has_value()) {
 		if (monitorIndex != -1)
 			return RequestResult::Error(RequestStatus::TooManyRequestFields,
 						    "`monitorIndex` and `projectorGeometry` are mutually exclusive.");
-		projectorGeometry = request.RequestData["projectorGeometry"];
+		projectorGeometry = req.projectorGeometry.value()->value();
 	}
 
 	obs_frontend_open_projector(projectorType, monitorIndex, projectorGeometry.c_str(), nullptr);
@@ -286,21 +269,18 @@ RequestResult RequestHandler::OpenSourceProjector(const Request &request)
 	if (!source)
 		return RequestResult::Error(statusCode, comment);
 
-	int monitorIndex = -1;
-	if (request.Contains("monitorIndex")) {
-		if (!request.ValidateOptionalNumber("monitorIndex", statusCode, comment, -1, 9))
-			return RequestResult::Error(statusCode, comment);
-		monitorIndex = request.RequestData["monitorIndex"];
-	}
+	auto parsed = ObsWebSocket::ParseRequest<ObsWebSocket::Protocol::OpenSourceProjectorRequest>(request);
+	if (auto *err = std::get_if<RequestResult>(&parsed))
+		return std::move(*err);
+	const auto &req = std::get<0>(parsed);
 
+	const int monitorIndex = req.monitorIndex.value().value().value();
 	std::string projectorGeometry;
-	if (request.Contains("projectorGeometry")) {
-		if (!request.ValidateOptionalString("projectorGeometry", statusCode, comment))
-			return RequestResult::Error(statusCode, comment);
+	if (req.projectorGeometry.value().has_value()) {
 		if (monitorIndex != -1)
 			return RequestResult::Error(RequestStatus::TooManyRequestFields,
 						    "`monitorIndex` and `projectorGeometry` are mutually exclusive.");
-		projectorGeometry = request.RequestData["projectorGeometry"];
+		projectorGeometry = req.projectorGeometry.value()->value();
 	}
 
 	obs_frontend_open_projector("Source", monitorIndex, projectorGeometry.c_str(), obs_source_get_name(source));

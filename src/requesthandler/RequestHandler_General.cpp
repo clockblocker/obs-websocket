@@ -21,6 +21,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <QSysInfo>
 
 #include "RequestHandler.h"
+#include "rpc/TypedRequest.h"
 #include "../websocketserver/WebSocketServer.h"
 #include "../eventhandler/types/EventSubscription.h"
 #include "../WebSocketApi.h"
@@ -46,23 +47,19 @@ with this program. If not, see <https://www.gnu.org/licenses/>
  */
 RequestResult RequestHandler::GetVersion(const Request &)
 {
-	json responseData;
-	responseData["obsVersion"] = Utils::Obs::StringHelper::GetObsVersion();
-	responseData["obsWebSocketVersion"] = OBS_WEBSOCKET_VERSION;
-	responseData["rpcVersion"] = OBS_WEBSOCKET_RPC_VERSION;
-	responseData["availableRequests"] = GetRequestList();
-
-	QList<QByteArray> imageWriterFormats = QImageWriter::supportedImageFormats();
 	std::vector<std::string> supportedImageFormats;
-	for (const QByteArray &format : imageWriterFormats) {
+	for (const QByteArray &format : QImageWriter::supportedImageFormats())
 		supportedImageFormats.push_back(format.toStdString());
-	}
-	responseData["supportedImageFormats"] = supportedImageFormats;
 
-	responseData["platform"] = QSysInfo::productType().toStdString();
-	responseData["platformDescription"] = QSysInfo::prettyProductName().toStdString();
-
-	return RequestResult::Success(responseData);
+	return ObsWebSocket::MakeResponse(ObsWebSocket::Protocol::GetVersionResponse{
+		.obsVersion = Utils::Obs::StringHelper::GetObsVersion(),
+		.obsWebSocketVersion = OBS_WEBSOCKET_VERSION,
+		.rpcVersion = OBS_WEBSOCKET_RPC_VERSION,
+		.availableRequests = GetRequestList(),
+		.supportedImageFormats = std::move(supportedImageFormats),
+		.platform = QSysInfo::productType().toStdString(),
+		.platformDescription = QSysInfo::prettyProductName().toStdString(),
+	});
 }
 
 /**
@@ -130,16 +127,17 @@ RequestResult RequestHandler::GetStats(const Request &)
  */
 RequestResult RequestHandler::BroadcastCustomEvent(const Request &request)
 {
-	RequestStatus::RequestStatus statusCode;
-	std::string comment;
-	if (!request.ValidateObject("eventData", statusCode, comment))
-		return RequestResult::Error(statusCode, comment);
+	auto parsed = ObsWebSocket::ParseRequest<ObsWebSocket::Protocol::BroadcastCustomEventRequest>(request);
+	if (auto *err = std::get_if<RequestResult>(&parsed))
+		return std::move(*err);
 
 	auto webSocketServer = GetWebSocketServer();
 	if (!webSocketServer)
 		return RequestResult::Error(RequestStatus::RequestProcessingFailed, "Unable to send event due to internal error.");
 
-	webSocketServer->BroadcastEvent(EventSubscription::General, "CustomEvent", request.RequestData["eventData"]);
+	webSocketServer->BroadcastEvent(
+		EventSubscription::General, "CustomEvent",
+		ObsWebSocket::Protocol::FromJsonObject(std::get<0>(parsed).eventData.value().value()));
 
 	return RequestResult::Success();
 }
@@ -167,22 +165,17 @@ RequestResult RequestHandler::BroadcastCustomEvent(const Request &request)
  */
 RequestResult RequestHandler::CallVendorRequest(const Request &request)
 {
-	RequestStatus::RequestStatus statusCode;
-	std::string comment;
-	if (!request.ValidateString("vendorName", statusCode, comment) ||
-	    !request.ValidateString("requestType", statusCode, comment))
-		return RequestResult::Error(statusCode, comment);
+	auto parsed = ObsWebSocket::ParseRequest<ObsWebSocket::Protocol::CallVendorRequestRequest>(request);
+	if (auto *err = std::get_if<RequestResult>(&parsed))
+		return std::move(*err);
+	const auto &req = std::get<0>(parsed);
+	const std::string &vendorName = req.vendorName.value().value();
+	const std::string &requestType = req.requestType.value().value();
 
-	std::string vendorName = request.RequestData["vendorName"];
-	std::string requestType = request.RequestData["requestType"];
-
-	OBSDataAutoRelease requestData = obs_data_create();
-	if (request.Contains("requestData")) {
-		if (!request.ValidateOptionalObject("requestData", statusCode, comment, true))
-			return RequestResult::Error(statusCode, comment);
-
-		requestData = Utils::Json::JsonToObsData(request.RequestData["requestData"]);
-	}
+	OBSDataAutoRelease requestData =
+		req.requestData.value().has_value()
+			? Utils::Json::JsonToObsData(ObsWebSocket::Protocol::FromJsonObject(*req.requestData.value()))
+			: obs_data_create();
 
 	OBSDataAutoRelease obsResponseData = obs_data_create();
 
@@ -202,12 +195,11 @@ RequestResult RequestHandler::CallVendorRequest(const Request &request)
 		return RequestResult::Error(RequestStatus::ResourceNotFound, "No request was found by that name.");
 	}
 
-	json responseData;
-	responseData["vendorName"] = vendorName;
-	responseData["requestType"] = requestType;
-	responseData["responseData"] = Utils::Json::ObsDataToJson(obsResponseData);
-
-	return RequestResult::Success(responseData);
+	return ObsWebSocket::MakeResponse(ObsWebSocket::Protocol::CallVendorRequestResponse{
+		.vendorName = vendorName,
+		.requestType = requestType,
+		.responseData = ObsWebSocket::Protocol::ToJsonObject(Utils::Json::ObsDataToJson(obsResponseData)),
+	});
 }
 
 /**
@@ -226,9 +218,9 @@ RequestResult RequestHandler::CallVendorRequest(const Request &request)
  */
 RequestResult RequestHandler::GetHotkeyList(const Request &)
 {
-	json responseData;
-	responseData["hotkeys"] = Utils::Obs::ArrayHelper::GetHotkeyNameList();
-	return RequestResult::Success(responseData);
+	return ObsWebSocket::MakeResponse(ObsWebSocket::Protocol::GetHotkeyListResponse{
+		.hotkeys = Utils::Obs::ArrayHelper::GetHotkeyNameList(),
+	});
 }
 
 /**
@@ -248,20 +240,14 @@ RequestResult RequestHandler::GetHotkeyList(const Request &)
  */
 RequestResult RequestHandler::TriggerHotkeyByName(const Request &request)
 {
-	RequestStatus::RequestStatus statusCode;
-	std::string comment;
-	if (!request.ValidateString("hotkeyName", statusCode, comment))
-		return RequestResult::Error(statusCode, comment);
+	auto parsed = ObsWebSocket::ParseRequest<ObsWebSocket::Protocol::TriggerHotkeyByNameRequest>(request);
+	if (auto *err = std::get_if<RequestResult>(&parsed))
+		return std::move(*err);
+	const auto &req = std::get<0>(parsed);
 
-	std::string contextName;
-	if (request.Contains("contextName")) {
-		if (!request.ValidateOptionalString("contextName", statusCode, comment))
-			return RequestResult::Error(statusCode, comment);
-
-		contextName = request.RequestData["contextName"];
-	}
-
-	obs_hotkey_t *hotkey = Utils::Obs::SearchHelper::GetHotkeyByName(request.RequestData["hotkeyName"], contextName);
+	const std::string contextName =
+		req.contextName.value().has_value() ? req.contextName.value()->value() : std::string{};
+	obs_hotkey_t *hotkey = Utils::Obs::SearchHelper::GetHotkeyByName(req.hotkeyName.value().value(), contextName);
 	if (!hotkey)
 		return RequestResult::Error(RequestStatus::ResourceNotFound, "No hotkeys were found by that name.");
 
@@ -292,36 +278,25 @@ RequestResult RequestHandler::TriggerHotkeyByName(const Request &request)
  */
 RequestResult RequestHandler::TriggerHotkeyByKeySequence(const Request &request)
 {
+	auto parsed = ObsWebSocket::ParseRequest<ObsWebSocket::Protocol::TriggerHotkeyByKeySequenceRequest>(request);
+	if (auto *err = std::get_if<RequestResult>(&parsed))
+		return std::move(*err);
+	const auto &req = std::get<0>(parsed);
+
 	obs_key_combination_t combo = {0};
+	if (req.keyId.value().has_value())
+		combo.key = obs_key_from_name(req.keyId.value()->value().c_str());
 
-	RequestStatus::RequestStatus statusCode = RequestStatus::NoError;
-	std::string comment;
-
-	if (request.Contains("keyId")) {
-		if (!request.ValidateOptionalString("keyId", statusCode, comment))
-			return RequestResult::Error(statusCode, comment);
-
-		std::string keyId = request.RequestData["keyId"];
-		combo.key = obs_key_from_name(keyId.c_str());
-	}
-
-	statusCode = RequestStatus::NoError;
-	if (request.Contains("keyModifiers")) {
-		if (!request.ValidateOptionalObject("keyModifiers", statusCode, comment, true))
-			return RequestResult::Error(statusCode, comment);
-
-		const json keyModifiersJson = request.RequestData["keyModifiers"];
+	if (req.keyModifiers.value().has_value()) {
+		const auto &mods = *req.keyModifiers.value();
 		uint32_t keyModifiers = 0;
-		if (keyModifiersJson.contains("shift") && keyModifiersJson["shift"].is_boolean() &&
-		    keyModifiersJson["shift"].get<bool>())
+		if (mods.shift.value().value())
 			keyModifiers |= INTERACT_SHIFT_KEY;
-		if (keyModifiersJson.contains("control") && keyModifiersJson["control"].is_boolean() &&
-		    keyModifiersJson["control"].get<bool>())
+		if (mods.control.value().value())
 			keyModifiers |= INTERACT_CONTROL_KEY;
-		if (keyModifiersJson.contains("alt") && keyModifiersJson["alt"].is_boolean() && keyModifiersJson["alt"].get<bool>())
+		if (mods.alt.value().value())
 			keyModifiers |= INTERACT_ALT_KEY;
-		if (keyModifiersJson.contains("command") && keyModifiersJson["command"].is_boolean() &&
-		    keyModifiersJson["command"].get<bool>())
+		if (mods.command.value().value())
 			keyModifiers |= INTERACT_COMMAND_KEY;
 		combo.modifiers = keyModifiers;
 	}
@@ -353,22 +328,27 @@ RequestResult RequestHandler::TriggerHotkeyByKeySequence(const Request &request)
  */
 RequestResult RequestHandler::Sleep(const Request &request)
 {
-	RequestStatus::RequestStatus statusCode;
-	std::string comment;
+	if (request.ExecutionType != RequestBatchExecutionType::SerialRealtime &&
+	    request.ExecutionType != RequestBatchExecutionType::SerialFrame)
+		return RequestResult::Error(RequestStatus::UnsupportedRequestBatchExecutionType);
+
+	auto parsed = ObsWebSocket::ParseRequest<ObsWebSocket::Protocol::SleepRequest>(request);
+	if (auto *err = std::get_if<RequestResult>(&parsed))
+		return std::move(*err);
+	const auto &req = std::get<0>(parsed);
 
 	if (request.ExecutionType == RequestBatchExecutionType::SerialRealtime) {
-		if (!request.ValidateNumber("sleepMillis", statusCode, comment, 0, 50000))
-			return RequestResult::Error(statusCode, comment);
-		int64_t sleepMillis = request.RequestData["sleepMillis"];
-		std::this_thread::sleep_for(std::chrono::milliseconds(sleepMillis));
+		if (!req.sleepMillis.value().has_value())
+			return RequestResult::Error(RequestStatus::MissingRequestField,
+						    "Your request is missing the `sleepMillis` field.");
+		std::this_thread::sleep_for(std::chrono::milliseconds(req.sleepMillis.value()->value()));
 		return RequestResult::Success();
-	} else if (request.ExecutionType == RequestBatchExecutionType::SerialFrame) {
-		if (!request.ValidateNumber("sleepFrames", statusCode, comment, 0, 10000))
-			return RequestResult::Error(statusCode, comment);
-		RequestResult ret = RequestResult::Success();
-		ret.SleepFrames = request.RequestData["sleepFrames"];
-		return ret;
-	} else {
-		return RequestResult::Error(RequestStatus::UnsupportedRequestBatchExecutionType);
 	}
+
+	if (!req.sleepFrames.value().has_value())
+		return RequestResult::Error(RequestStatus::MissingRequestField,
+					    "Your request is missing the `sleepFrames` field.");
+	RequestResult ret = RequestResult::Success();
+	ret.SleepFrames = static_cast<size_t>(req.sleepFrames.value()->value());
+	return ret;
 }

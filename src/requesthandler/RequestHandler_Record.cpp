@@ -18,6 +18,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 */
 
 #include "RequestHandler.h"
+#include "rpc/TypedRequest.h"
 
 /**
  * Gets the status of the record output.
@@ -41,14 +42,13 @@ RequestResult RequestHandler::GetRecordStatus(const Request &)
 
 	uint64_t outputDuration = Utils::Obs::NumberHelper::GetOutputDuration(recordOutput);
 
-	json responseData;
-	responseData["outputActive"] = obs_output_active(recordOutput);
-	responseData["outputPaused"] = obs_output_paused(recordOutput);
-	responseData["outputTimecode"] = Utils::Obs::StringHelper::DurationToTimecode(outputDuration);
-	responseData["outputDuration"] = outputDuration;
-	responseData["outputBytes"] = (uint64_t)obs_output_get_total_bytes(recordOutput);
-
-	return RequestResult::Success(responseData);
+	return ObsWebSocket::MakeResponse(ObsWebSocket::Protocol::GetRecordStatusResponse{
+		.outputActive = obs_output_active(recordOutput),
+		.outputPaused = obs_output_paused(recordOutput),
+		.outputTimecode = Utils::Obs::StringHelper::DurationToTimecode(outputDuration),
+		.outputDuration = outputDuration,
+		.outputBytes = static_cast<uint64_t>(obs_output_get_total_bytes(recordOutput)),
+	});
 }
 
 /**
@@ -65,16 +65,13 @@ RequestResult RequestHandler::GetRecordStatus(const Request &)
  */
 RequestResult RequestHandler::ToggleRecord(const Request &)
 {
-	json responseData;
-	if (obs_frontend_recording_active()) {
-		obs_frontend_recording_stop();
-		responseData["outputActive"] = false;
-	} else {
+	const bool nowActive = !obs_frontend_recording_active();
+	if (nowActive)
 		obs_frontend_recording_start();
-		responseData["outputActive"] = true;
-	}
+	else
+		obs_frontend_recording_stop();
 
-	return RequestResult::Success(responseData);
+	return ObsWebSocket::MakeResponse(ObsWebSocket::Protocol::ToggleRecordResponse{.outputActive = nowActive});
 }
 
 /**
@@ -118,10 +115,9 @@ RequestResult RequestHandler::StopRecord(const Request &)
 	// TODO: Call signal directly to perform blocking wait
 	obs_frontend_recording_stop();
 
-	json responseData;
-	responseData["outputPath"] = Utils::Obs::StringHelper::GetLastRecordFileName();
-
-	return RequestResult::Success(responseData);
+	return ObsWebSocket::MakeResponse(ObsWebSocket::Protocol::StopRecordResponse{
+		.outputPath = Utils::Obs::StringHelper::GetLastRecordFileName(),
+	});
 }
 
 /**
@@ -136,16 +132,9 @@ RequestResult RequestHandler::StopRecord(const Request &)
  */
 RequestResult RequestHandler::ToggleRecordPause(const Request &)
 {
-	json responseData;
-	if (obs_frontend_recording_paused()) {
-		obs_frontend_recording_pause(false);
-		responseData["outputPaused"] = false;
-	} else {
-		obs_frontend_recording_pause(true);
-		responseData["outputPaused"] = true;
-	}
-
-	return RequestResult::Success(responseData);
+	const bool nowPaused = !obs_frontend_recording_paused();
+	obs_frontend_recording_pause(nowPaused);
+	return ObsWebSocket::MakeResponse(ObsWebSocket::Protocol::ToggleRecordPauseResponse{.outputPaused = nowPaused});
 }
 
 /**
@@ -228,19 +217,15 @@ RequestResult RequestHandler::SplitRecordFile(const Request &)
  */
 RequestResult RequestHandler::CreateRecordChapter(const Request &request)
 {
-	std::string chapterName;
-	if (request.Contains("chapterName")) {
-		RequestStatus::RequestStatus statusCode;
-		std::string comment;
-		if (!request.ValidateOptionalString("chapterName", statusCode, comment))
-			return RequestResult::Error(statusCode, comment);
-		chapterName = request.RequestData["chapterName"];
-	}
+	auto parsed = ObsWebSocket::ParseRequest<ObsWebSocket::Protocol::CreateRecordChapterRequest>(request);
+	if (auto *err = std::get_if<RequestResult>(&parsed))
+		return std::move(*err);
+	const auto &chapterName = std::get<0>(parsed).chapterName.value();
 
 	if (!obs_frontend_recording_active())
 		return RequestResult::Error(RequestStatus::OutputNotRunning);
 
-	if (!obs_frontend_recording_add_chapter(chapterName.empty() ? nullptr : chapterName.c_str()))
+	if (!obs_frontend_recording_add_chapter(chapterName.has_value() ? chapterName->value().c_str() : nullptr))
 		return RequestResult::Error(RequestStatus::RequestProcessingFailed,
 					    "Verify that the output being used supports chapter markers.");
 
